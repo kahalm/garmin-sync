@@ -5,7 +5,8 @@ Garmin liefert Puls-/Schritt-Verläufe über die API nur für die letzten Monate
 Für die ganze Historie bleiben zwei Quellen, die hier roh abgelegt werden:
   - Tageszusammenfassung (~90 Felder je Tag: Schritte, Kalorien, Ruhepuls, …)
   - Original-FIT-Dateien der Uhr je Tag (volle Auflösung, ungeparst)
-Dazu je Monat HRV und VO2max. Aus dem JSON entsteht data/garmin_extras.db.
+Dazu je Monat HRV und VO2max. Aus dem JSON entsteht data/garmin_extras.db —
+samt strength_set_all, der vollständigen Fassung der Kraftsätze des Werkzeugs.
 
   extras.py                      letzte 7 Tage neu (täglicher Lauf)
   extras.py --from 2017-01-01    Historie nachholen; Vorhandenes wird übersprungen
@@ -14,6 +15,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -148,6 +150,21 @@ def rebuild_db():
                 vo2.append((day, g.get("vo2MaxPreciseValue"), c.get("vo2MaxPreciseValue"),
                             g.get("fitnessAge")))
 
+    # Kraftsätze: Das Werkzeug verwirft Sätze ohne messageIndex — den lässt Garmin weg,
+    # sobald man die Übungen einer Einheit in Connect von Hand benennt. Hier zählt
+    # stattdessen die Position in der Rohdatei.
+    strength = []
+    for f in sorted(glob.glob(str(DATA / "garmin_files" / "storage" / "*_EXERCISE_SETS_*.json"))):
+        m = re.search(r"_EXERCISE_SETS_(\d+)_(\d{4}-\d{2}-\d{2})T", f)
+        sets = (json.loads(Path(f).read_text()) or {}).get("exerciseSets") or []
+        for idx, s in enumerate(sets):
+            best = max(s.get("exercises") or [{}], key=lambda e: e.get("probability") or 0)
+            weight = s.get("weight")
+            strength.append((int(m.group(1)), m.group(2), idx, s.get("setType"), s.get("startTime"),
+                             s.get("duration"), s.get("repetitionCount"),
+                             weight / 1000 if weight is not None and weight >= 0 else None,
+                             best.get("category"), best.get("name"), best.get("probability")))
+
     tmp = DB.with_suffix(".db.tmp")
     tmp.unlink(missing_ok=True)
     con = sqlite3.connect(tmp)
@@ -165,10 +182,15 @@ def rebuild_db():
     con.execute("CREATE TABLE vo2max_daily (calendarDate TEXT PRIMARY KEY, vo2maxRunning,"
                 " vo2maxCycling, fitnessAge)")
     con.executemany("INSERT OR REPLACE INTO vo2max_daily VALUES (?,?,?,?)", vo2)
+    con.execute("CREATE TABLE strength_set_all (activity_id INTEGER, calendarDate TEXT, set_idx INTEGER,"
+                " set_type, start_time, duration_s, reps, weight_kg, exercise_category,"
+                " exercise_name, exercise_probability, PRIMARY KEY (activity_id, set_idx))")
+    con.executemany("INSERT INTO strength_set_all VALUES (?,?,?,?,?,?,?,?,?,?,?)", strength)
     con.commit()
     con.close()
     tmp.replace(DB)
-    log(f"DB neu gebaut: {len(summaries)} Tage, {len(hrv)} HRV, {len(vo2)} VO2max")
+    log(f"DB neu gebaut: {len(summaries)} Tage, {len(hrv)} HRV, {len(vo2)} VO2max, "
+        f"{len(strength)} Kraftsätze")
 
 
 def main():
