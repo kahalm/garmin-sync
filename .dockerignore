@@ -3,4 +3,6 @@
 !sync.sh
 !backfill.sh
 !extras.py
+!next_workout.py
+!mcp_server.py
 !entrypoint.sh

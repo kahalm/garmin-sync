@@ -6,9 +6,9 @@ ARG GARMIN_HEALTH_DATA_VERSION=2.16.0
 RUN apt-get update \
  && apt-get install -y --no-install-recommends sqlite3 tzdata \
  && rm -rf /var/lib/apt/lists/* \
- && pip install --no-cache-dir "garmin-health-data==${GARMIN_HEALTH_DATA_VERSION}"
+ && pip install --no-cache-dir "garmin-health-data==${GARMIN_HEALTH_DATA_VERSION}" "mcp==2.2.0"
 
-COPY env.sh sync.sh backfill.sh extras.py entrypoint.sh /app/
+COPY env.sh sync.sh backfill.sh extras.py next_workout.py mcp_server.py entrypoint.sh /app/
 
 # HOME liegt auf dem Volume, damit die Garmin-Tokens (~/.garminconnect) überleben.
 ENV GARMIN_DATA=/data \

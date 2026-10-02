@@ -123,6 +123,99 @@ def write(path, content):
     tmp.replace(path)
 
 
+SQUAT = ("SQUAT", "BARBELL_BACK_SQUAT")
+BENCH = ("BENCH_PRESS", "BARBELL_BENCH_PRESS")
+ROW = ("ROW", "BARBELL_ROW")
+PRESS = ("SHOULDER_PRESS", "OVERHEAD_BARBELL_PRESS")
+DEADLIFT = ("DEADLIFT", "BARBELL_DEADLIFT")
+# Eine Schreibweise je Übung — Garmin liefert je nach Eingabe mal nur die Kategorie
+# (BENCH_PRESS), mal eine Variante (WEIGHTED_SQUAT), mal den vollen Namen.
+CANONICAL = dict([SQUAT, BENCH, ROW, PRESS, DEADLIFT, ("SHRUG", "DUMBBELL_SHRUG")])
+
+
+def guess_stronglifts(active):
+    """Errät die Übungen einer Einheit, die nach StrongLifts 5x5 aufgebaut ist.
+
+    Die Uhr erkennt Übungen nur ungefähr (UNKNOWN, Overhead Press als Bankdrücken).
+    Der Aufbau ist aber fest: erst Kniebeuge, dann entweder Bankdrücken + Rudern (A)
+    oder Overhead Press + Kreuzheben (B). Welcher Plan es war, verrät ein von der Uhr
+    erkannter Ruder- bzw. Kreuzhebe-Satz; ohne einen solchen wird nichts erraten.
+
+    active: aktive Sätze in Reihenfolge, je {"kg", "category"}.
+    Liefert je Satz (Kategorie, Name) oder None für „unverändert lassen".
+    """
+    cats = {s["category"] for s in active}
+    plan = "A" if "ROW" in cats else "B" if "DEADLIFT" in cats else None
+    if plan is None:
+        return [None] * len(active)
+    kg = [s["kg"] or 0 for s in active]
+    # Ein deutlich leichterer Satz heißt: nächste Übung. Ein kleiner Schritt zurück
+    # (ein Satz nicht geschafft, 2,5 kg weniger) bleibt dieselbe Übung.
+    drops = [i for i in range(1, len(kg)) if kg[i] < 0.85 * kg[i - 1]]
+    if not drops:
+        return [None] * len(active)
+    labels = [None] * len(active)
+    second = drops[0]  # hier endet die Kniebeuge
+    labels[:second] = [SQUAT] * second
+
+    if plan == "A":
+        later = [i for i in drops if i > second]
+        if later:  # Rudern beginnt mit einem leichteren Aufwärmsatz
+            third = later[-1]
+        else:      # gleiches oder höheres Gewicht: Rudern sind die letzten (höchstens 5) Sätze
+            run = len(kg) - 1
+            while run > second and kg[run - 1] == kg[-1]:
+                run -= 1
+            third = max(run, len(kg) - 5)
+        labels[second:third] = [BENCH] * (third - second)
+        labels[third:] = [ROW] * (len(kg) - third)
+        return labels
+
+    # Plan B: die Arbeitssätze der Overhead Press sind die erste Serie von mindestens
+    # drei gleich schweren Sätzen; danach steigt das Kreuzheben bis zum ersten Abfall.
+    i = second
+    while i + 2 < len(kg) and not (kg[i] == kg[i + 1] == kg[i + 2]):
+        i += 1
+    if i + 2 >= len(kg):
+        return labels
+    third = i
+    while third < len(kg) and kg[third] == kg[i]:
+        third += 1
+    end = next((d for d in drops if d > third), len(kg))
+    labels[second:third] = [PRESS] * (third - second)
+    labels[third:end] = [DEADLIFT] * (end - third)
+    return labels
+
+
+def read_strength_sets():
+    """Alle Kraftsätze aus den Rohdateien, je Einheit (activity_id, Tag, Sätze)."""
+    for f in sorted(glob.glob(str(DATA / "garmin_files" / "storage" / "*_EXERCISE_SETS_*.json"))):
+        m = re.search(r"_EXERCISE_SETS_(\d+)_(\d{4}-\d{2}-\d{2})T", f)
+        sets = []
+        for idx, s in enumerate((json.loads(Path(f).read_text()) or {}).get("exerciseSets") or []):
+            best = max(s.get("exercises") or [{}], key=lambda e: e.get("probability") or 0)
+            weight = s.get("weight")
+            sets.append({
+                "idx": idx, "type": s.get("setType"), "start": s.get("startTime"),
+                "duration": s.get("duration"), "reps": s.get("repetitionCount"),
+                "kg": weight / 1000 if weight is not None and weight >= 0 else None,
+                "category": best.get("category"), "name": best.get("name"),
+                "probability": best.get("probability"),
+                "garmin_category": best.get("category"), "garmin_name": best.get("name"),
+                "guessed": False,
+            })
+        active = [s for s in sets if s["type"] == "ACTIVE"]
+        # Nur Einheiten mit unerkannten Sätzen anfassen; von Hand benannte bleiben, wie sie sind.
+        if any((s["category"] or "UNKNOWN") == "UNKNOWN" for s in active):
+            for s, label in zip(active, guess_stronglifts(active)):
+                if label and (s["category"], s["name"]) != label:
+                    s["category"], s["name"], s["guessed"] = label[0], label[1], True
+        # Auch erkannte und von Hand benannte Sätze bekommen den einheitlichen Namen.
+        for s in active:
+            s["name"] = CANONICAL.get(s["category"], s["name"])
+        yield int(m.group(1)), m.group(2), sets
+
+
 def rebuild_db():
     """Baut die Tabellen jedes Mal komplett aus den Rohdateien neu."""
     summaries = []
@@ -154,16 +247,11 @@ def rebuild_db():
     # sobald man die Übungen einer Einheit in Connect von Hand benennt. Hier zählt
     # stattdessen die Position in der Rohdatei.
     strength = []
-    for f in sorted(glob.glob(str(DATA / "garmin_files" / "storage" / "*_EXERCISE_SETS_*.json"))):
-        m = re.search(r"_EXERCISE_SETS_(\d+)_(\d{4}-\d{2}-\d{2})T", f)
-        sets = (json.loads(Path(f).read_text()) or {}).get("exerciseSets") or []
-        for idx, s in enumerate(sets):
-            best = max(s.get("exercises") or [{}], key=lambda e: e.get("probability") or 0)
-            weight = s.get("weight")
-            strength.append((int(m.group(1)), m.group(2), idx, s.get("setType"), s.get("startTime"),
-                             s.get("duration"), s.get("repetitionCount"),
-                             weight / 1000 if weight is not None and weight >= 0 else None,
-                             best.get("category"), best.get("name"), best.get("probability")))
+    for activity_id, day, sets in read_strength_sets():
+        for s in sets:
+            strength.append((activity_id, day, s["idx"], s["type"], s["start"], s["duration"],
+                             s["reps"], s["kg"], s["category"], s["name"], s["probability"],
+                             s["garmin_category"], s["garmin_name"], int(s["guessed"])))
 
     tmp = DB.with_suffix(".db.tmp")
     tmp.unlink(missing_ok=True)
@@ -182,10 +270,13 @@ def rebuild_db():
     con.execute("CREATE TABLE vo2max_daily (calendarDate TEXT PRIMARY KEY, vo2maxRunning,"
                 " vo2maxCycling, fitnessAge)")
     con.executemany("INSERT OR REPLACE INTO vo2max_daily VALUES (?,?,?,?)", vo2)
+    # exercise_* ist die korrigierte Fassung, garmin_* was Garmin geliefert hat;
+    # guessed = 1, wo die Übung aus dem Aufbau der Einheit erraten wurde.
     con.execute("CREATE TABLE strength_set_all (activity_id INTEGER, calendarDate TEXT, set_idx INTEGER,"
                 " set_type, start_time, duration_s, reps, weight_kg, exercise_category,"
-                " exercise_name, exercise_probability, PRIMARY KEY (activity_id, set_idx))")
-    con.executemany("INSERT INTO strength_set_all VALUES (?,?,?,?,?,?,?,?,?,?,?)", strength)
+                " exercise_name, exercise_probability, garmin_category, garmin_name, guessed INTEGER,"
+                " PRIMARY KEY (activity_id, set_idx))")
+    con.executemany("INSERT INTO strength_set_all VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", strength)
     con.commit()
     con.close()
     tmp.replace(DB)
@@ -202,6 +293,8 @@ def main():
     ap.add_argument("--refresh-days", type=int, default=7,
                     help="so viele jüngste Tage auch dann neu holen, wenn sie schon da sind")
     ap.add_argument("--db-only", action="store_true", help="nur die DB aus den Rohdateien bauen")
+    ap.add_argument("--last-upload", action="store_true",
+                    help="nur ausgeben, wann die Uhr zuletzt zu Garmin hochgeladen hat (Ortszeit)")
     args = ap.parse_args()
 
     fails = 0
@@ -211,6 +304,12 @@ def main():
             sys.exit("nicht eingeloggt: erst 'garmin auth' ausführen")
         client = GarminClient()
         client.load(tokens[0])
+        if args.last_upload:
+            # Eine einzelne Anfrage — damit lässt sich billig prüfen, ob es Neues gibt.
+            device = client._connectapi("/device-service/deviceservice/mylastused")
+            ms = device["lastUsedDeviceUploadTime"]
+            print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ms / 1000)))
+            return
         client._load_profile()
         refresh_from = date.today() - timedelta(days=args.refresh_days)
         log(f"extras {args.start} bis {args.end}")

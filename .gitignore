@@ -2,6 +2,9 @@
 data/
 # Sicherung der kompletten Host-Crontab
 .crontab.bak
+# Geheimnis des MCP-Servers und host-spezifische Compose-Ergänzung
+.env
+compose.override.yml
 
 .venv/
 __pycache__/

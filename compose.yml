@@ -12,11 +12,46 @@ services:
       TZ: Europe/Vienna
       GARMIN_START: "2017-01-01"  # ab hier holt der erste Start die Historie
       SYNC_TIME: "05:40"          # täglicher Abgleich
+      REFRESH_SECONDS: "300"      # so oft prüfen, ob die Uhr neu hochgeladen hat (0 = aus)
+      PUSH_NEXT_WORKOUT: "1"      # nächste 5x5-Einheit als Workout auf die Uhr (schreibt ins Garmin-Konto)
     volumes:
       # Datenbanken, Rohdateien, Tokens und Logs — alles, was überleben muss.
       - ./data:/data
     labels:
       # Lokal gebautes Image: Watchtower fände es in keiner Registry.
+      - com.centurylinklabs.watchtower.enable=false
+    logging:
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # MCP-Server für Claude (Browser, Desktop, Handy): lesender Zugriff auf die Datenbanken.
+  # Startet nur mit COMPOSE_PROFILES=mcp und einem MCP_PATH_SECRET in .env. Claude verbindet
+  # sich aus Anthropics Rechenzentrum — davor gehört ein Reverse-Proxy mit TLS, der nur
+  # Anthropics Adressbereich durchlässt (siehe mcp_server.py).
+  mcp:
+    image: garmin-sync:local
+    container_name: garmin-mcp
+    profiles: ["mcp"]
+    command: ["mcp"]
+    init: true
+    user: "1000:1000"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      TZ: Europe/Vienna
+      MCP_PATH_SECRET: ${MCP_PATH_SECRET:-}      # Adresse wird https://<host>/<Geheimnis>/mcp
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}  # Hostname, unter dem der Proxy ihn anspricht
+    volumes:
+      - ./data:/data:ro
+    tmpfs:
+      - /data/.garminconnect  # verdeckt die Garmin-Tokens vor diesem Container
+      - /tmp
+    ports:
+      - "127.0.0.1:8103:8000"
+    labels:
       - com.centurylinklabs.watchtower.enable=false
     logging:
       options:
