@@ -1,0 +1,24 @@
+# Garmin-Daten → SQLite. Start: docker compose up -d
+# Erstanmeldung (nur auf einem frischen Volume): docker compose run --rm garmin auth
+services:
+  garmin:
+    build: .
+    image: garmin-sync:local
+    container_name: garmin-sync
+    init: true
+    user: "1000:1000"
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Vienna
+      GARMIN_START: "2017-01-01"  # ab hier holt der erste Start die Historie
+      SYNC_TIME: "05:40"          # täglicher Abgleich
+    volumes:
+      # Datenbanken, Rohdateien, Tokens und Logs — alles, was überleben muss.
+      - ./data:/data
+    labels:
+      # Lokal gebautes Image: Watchtower fände es in keiner Registry.
+      - com.centurylinklabs.watchtower.enable=false
+    logging:
+      options:
+        max-size: "5m"
+        max-file: "2"

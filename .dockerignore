@@ -1,0 +1,6 @@
+*
+!env.sh
+!sync.sh
+!backfill.sh
+!extras.py
+!entrypoint.sh

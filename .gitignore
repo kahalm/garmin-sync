@@ -1,0 +1,7 @@
+# Privat: Garmin-Tokens, Gesundheitsdaten, Logs mit Konto-Kennung
+data/
+# Sicherung der kompletten Host-Crontab
+.crontab.bak
+
+.venv/
+__pycache__/
