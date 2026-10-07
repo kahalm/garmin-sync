@@ -3,8 +3,8 @@
 
 Aus der Historie (strength_set_all) ergibt sich, welcher Plan dran ist (A: Kniebeuge,
 Bankdrücken, Rudern — B: Kniebeuge, Overhead Press, Kreuzheben) und mit welchem Gewicht.
-Daraus entsteht EIN Workout in Garmin Connect, das bei jeder Änderung überschrieben,
-ans zuletzt benutzte Gerät geschickt und in den Kalender gelegt wird. Die Uhr führt
+Daraus entsteht ein Workout in Garmin Connect, das bei jeder Änderung neu angelegt
+(das alte wird gelöscht), ans zuletzt benutzte Gerät geschickt und in den Kalender gelegt wird. Die Uhr führt
 dann Satz für Satz durch und benennt die Übungen gleich richtig.
 
 Schreibt ins Garmin-Konto, aber nur an dem einen Workout und dem einen Kalendereintrag,
@@ -29,55 +29,59 @@ STATE = DATA / ".next_workout.json"
 # sets: Arbeitssätze; step: Steigerung je geschaffter Einheit; fast: größere Steigerung,
 # solange das Gewicht unter 75 % des eigenen Bestwerts liegt (Wiedereinstieg);
 # slow_from: ab diesem Gewicht erst nach zwei geschafften Einheiten steigern.
+# micro_from/micro_step: ab diesem Gewicht in kleinen Schritten (Mini-Scheiben) steigern.
 LIFTS = {
     "squat": dict(cat="SQUAT", name="BARBELL_BACK_SQUAT", label="Kniebeuge", sets=5, step=2.5, fast=5),
     "bench": dict(cat="BENCH_PRESS", name="BARBELL_BENCH_PRESS", label="Bankdrücken", sets=5, step=2.5, fast=5),
     "row": dict(cat="ROW", name="BARBELL_ROW", label="Rudern", sets=5, step=2.5, fast=5),
+    # Ab 30 kg in 1-kg-Schritten (0,5-kg-Scheiben je Seite) — bei der Overhead Press sind
+    # 2,5 kg schon 7–8 % mehr, daran ist der Nutzer in jedem Block hängen geblieben.
     "press": dict(cat="SHOULDER_PRESS", name="OVERHEAD_BARBELL_PRESS", label="Overhead Press",
-                  sets=5, step=2.5, slow_from=30),
+                  sets=5, step=2.5, micro_from=30, micro_step=1.0),
     "deadlift": dict(cat="DEADLIFT", name="BARBELL_DEADLIFT", label="Kreuzheben", sets=1, step=5),
+}
+# Ergänzung am Ende jeder Einheit, ohne Gewicht und ohne automatische Steigerung —
+# leichter wird es über ein dünneres Band (Wunsch des Nutzers, 05.10.2026).
+ACCESSORIES = {
+    "chin": dict(cat="PULL_UP", name="BAND_ASSISTED_CHIN_UP", label="Klimmzug mit Band (Untergriff)",
+                 sets=3, reps=5),
+    # in den Ellbogen-Schlaufen hängend, gezielte Rumpfübung
+    "knee": dict(cat="LEG_RAISE", name="HANGING_KNEE_RAISE", label="Hängendes Knieheben (Schlaufen)",
+                 sets=2, reps=10),
 }
 PLANS = {"A": ["squat", "bench", "row"], "B": ["squat", "press", "deadlift"]}
 REPS = 5
 BAR = 20.0
+WORK_REST_SECONDS = 90
 REST_DAYS = 2          # übernächster Tag
+# Wochentage ohne Training (0 = Montag … 6 = Sonntag), per Umgebung änderbar, z. B. "2,4".
+# Fällt der Termin darauf, rückt er auf den nächsten freien Tag.
+BLOCKED_WEEKDAYS = {int(d) for d in os.environ.get("TRAINING_BLOCKED_WEEKDAYS", "").split(",") if d.strip()}
 RESTART_AFTER_DAYS = 28  # längere Pause bei einer Übung: mit 85 % wieder einsteigen
 RESTART_FACTOR = 0.85
 FAILS_BEFORE_DELOAD = 3
 DELOAD_FACTOR = 0.9
 
 
-def round_plate(kg):
-    return max(BAR, round(kg / 2.5) * 2.5)
+def round_plate(kg, lift=None):
+    """Auf auflegbare Gewichte runden: 2,5-kg-Schritte, mit Mini-Scheiben 0,5 kg."""
+    grain = 0.5 if lift and LIFTS[lift].get("micro_from") and kg >= LIFTS[lift]["micro_from"] else 2.5
+    return max(BAR, round(kg / grain) * grain)
 
 
 def history():
-    """Je Einheit (Tag, {Übung: [(kg, Wdh.), …]}), älteste zuerst."""
+    """Je Einheit (Tag, {Übung: (Arbeitsgewicht, geschafft)}), älteste zuerst.
+
+    Das Arbeitsgewicht je Einheit rechnet extras.py aus (Tabelle strength_work).
+    """
     by_name = {v["name"]: k for k, v in LIFTS.items()}
     con = sqlite3.connect(f"file:{DATA / 'garmin_extras.db'}?mode=ro", uri=True)
     sessions = {}
-    for aid, day, name, kg, reps in con.execute(
-            "SELECT activity_id, calendarDate, exercise_name, weight_kg, reps FROM strength_set_all"
-            " WHERE set_type = 'ACTIVE' ORDER BY activity_id, set_idx"):
-        lift = by_name.get(name)
-        if lift and kg and reps:
-            sessions.setdefault((aid, day), {}).setdefault(lift, []).append((kg, reps))
+    for aid, day, name, kg, ok in con.execute(
+            "SELECT activity_id, calendarDate, exercise_name, work_kg, success FROM strength_work"):
+        if name in by_name:
+            sessions.setdefault((aid, day), {})[by_name[name]] = (kg, bool(ok))
     return [(date.fromisoformat(day), lifts) for (_, day), lifts in sorted(sessions.items())]
-
-
-def outcome(sets, lift):
-    """Arbeitsgewicht einer Übung in einer Einheit und ob alle Sätze geschafft wurden."""
-    top = max(kg for kg, _ in sets)
-    if LIFTS[lift]["sets"] == 1:
-        kg = top
-    else:  # das Gewicht mit den meisten Sätzen nahe am Maximum, nicht die Aufwärmsätze
-        count = {}
-        for w, _ in sets:
-            if w >= 0.8 * top:
-                count[w] = count.get(w, 0) + 1
-        kg = max(count, key=lambda w: (count[w], w))
-    done = sum(1 for w, reps in sets if w == kg and reps >= REPS)
-    return kg, done >= LIFTS[lift]["sets"]
 
 
 def next_weight(lift, past, planned):
@@ -87,7 +91,7 @@ def next_weight(lift, past, planned):
         return BAR, "erste Einheit"
     last_day, kg, ok = past[-1]
     if (planned - last_day).days > RESTART_AFTER_DAYS:
-        return round_plate(kg * RESTART_FACTOR), f"Wiedereinstieg nach Pause (zuletzt {kg:g} kg am {last_day:%d.%m.%Y})"
+        return round_plate(kg * RESTART_FACTOR, lift), f"Wiedereinstieg nach Pause (zuletzt {kg:g} kg am {last_day:%d.%m.%Y})"
     streak = 0  # wie oft in Folge dasselbe Gewicht mit demselben Ausgang
     for _, w, o in reversed(past):
         if w != kg or o != ok:
@@ -95,12 +99,16 @@ def next_weight(lift, past, planned):
         streak += 1
     if not ok:
         if streak >= FAILS_BEFORE_DELOAD:
-            return round_plate(kg * DELOAD_FACTOR), f"{streak}× nicht geschafft bei {kg:g} kg → 10 % zurück"
+            return round_plate(kg * DELOAD_FACTOR, lift), f"{streak}× nicht geschafft bei {kg:g} kg → 10 % zurück"
         return kg, f"zuletzt nicht alle Sätze geschafft → {kg:g} kg wiederholen"
     if cfg.get("slow_from") and kg >= cfg["slow_from"] and streak < 2:
         return kg, f"ab {cfg['slow_from']:g} kg erst nach zwei geschafften Einheiten steigern"
     best = max(w for _, w, _ in past)
     step = cfg["fast"] if cfg.get("fast") and kg < 0.75 * best else cfg["step"]
+    if cfg.get("micro_from") and kg >= cfg["micro_from"]:
+        step = cfg["micro_step"]
+    elif cfg.get("micro_from") and kg + step > cfg["micro_from"]:
+        step = cfg["micro_from"] - kg  # nicht über die Schwelle springen
     return kg + step, f"geschafft → +{step:g} kg"
 
 
@@ -127,19 +135,32 @@ def warmups(lift, kg):
     return sets
 
 
-def plan_next(today):
+def plan_next(today, fixed_date=None):
+    """fixed_date: vom Nutzer festgelegter Termin (Knopf „heute einplanen“) statt der Regel."""
     sessions = history()
     if not sessions:
         return None
     last_day, last_lifts = sessions[-1]
     plan = "A" if "deadlift" in last_lifts or "press" in last_lifts else "B"
     planned = max(today, last_day + timedelta(days=REST_DAYS))
+    while planned.weekday() in BLOCKED_WEEKDAYS and len(BLOCKED_WEEKDAYS) < 7:
+        planned += timedelta(days=1)
+    if fixed_date:
+        planned = fixed_date
     exercises = []
     for lift in PLANS[plan]:
-        past = [(day, *outcome(lifts[lift], lift)) for day, lifts in sessions if lift in lifts]
+        past = [(day, *lifts[lift]) for day, lifts in sessions if lift in lifts]
         kg, why = next_weight(lift, past, planned)
         exercises.append({"lift": lift, "kg": kg, "why": why, "warmup": warmups(lift, kg)})
+    for lift in ACCESSORIES:
+        why = {"chin": "mit Band; leichter wird es mit dünnerem Band",
+               "knee": "Rumpf; später Beine gestreckt oder mehr Wiederholungen"}[lift]
+        exercises.append({"lift": lift, "kg": None, "why": why, "warmup": []})
     return {"plan": plan, "date": planned.isoformat(), "after": last_day.isoformat(), "exercises": exercises}
+
+
+def cfg_of(lift):
+    return LIFTS.get(lift) or ACCESSORIES[lift]
 
 
 def build_workout(plan):
@@ -152,15 +173,16 @@ def build_workout(plan):
         return order
 
     def exercise(lift, kg, reps):
-        cfg = LIFTS[lift]
-        return {
+        cfg = cfg_of(lift)
+        weight = {} if kg is None else {
+            "weightValue": kg * 1000.0, "weightUnit": {"unitId": 8, "unitKey": "kilogram", "factor": 1000.0}}
+        return weight | {
             "type": "ExecutableStepDTO", "stepOrder": nxt(),
             "stepType": {"stepTypeId": 3, "stepTypeKey": "interval", "displayOrder": 3},
             "endCondition": {"conditionTypeId": 10, "conditionTypeKey": "reps", "displayOrder": 10, "displayable": True},
             "endConditionValue": float(reps),
             "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target", "displayOrder": 1},
             "category": cfg["cat"], "exerciseName": cfg["name"],
-            "weightValue": kg * 1000.0, "weightUnit": {"unitId": 8, "unitKey": "kilogram", "factor": 1000.0},
         }
 
     def rest(seconds):
@@ -174,13 +196,15 @@ def build_workout(plan):
 
     steps = []
     for ex in plan["exercises"]:
-        lift, kg, sets = ex["lift"], ex["kg"], LIFTS[ex["lift"]]["sets"]
+        lift, kg, sets = ex["lift"], ex["kg"], cfg_of(ex["lift"])["sets"]
+        reps = cfg_of(lift).get("reps", REPS)
         for w, reps in ex["warmup"]:
             steps += [exercise(lift, w, reps), rest(60)]
-        # Schwere Sätze brauchen längere Pausen; LAP auf der Uhr überspringt sie.
-        pause = 180 if kg >= 60 else 120
+        # Pause zwischen Arbeitssätzen, unabhängig vom Gewicht (Wunsch des Nutzers);
+        # LAP auf der Uhr beendet sie vorzeitig.
+        pause = WORK_REST_SECONDS
         if sets == 1:
-            steps += [exercise(lift, kg, REPS), rest(pause)]
+            steps += [exercise(lift, kg, reps), rest(pause)]
         else:
             group = {
                 "type": "RepeatGroupDTO", "stepOrder": nxt(),
@@ -189,12 +213,13 @@ def build_workout(plan):
                 "endCondition": {"conditionTypeId": 7, "conditionTypeKey": "iterations", "displayOrder": 7, "displayable": False},
                 "endConditionValue": float(sets),
             }
-            group["workoutSteps"] = [exercise(lift, kg, REPS), rest(pause)]
+            group["workoutSteps"] = [exercise(lift, kg, reps), rest(pause)]
             steps.append(group)
     sport = {"sportTypeId": 5, "sportTypeKey": "strength_training"}
-    summary = " · ".join(f"{LIFTS[e['lift']]['label']} {e['kg']:g}" for e in plan["exercises"])
+    main = [e for e in plan["exercises"] if e["kg"] is not None]
+    summary = " · ".join(f"{LIFTS[e['lift']]['label']} {e['kg']:g}" for e in main)
     return {
-        "workoutName": f"5x5 {plan['plan']}: " + "/".join(f"{e['kg']:g}" for e in plan["exercises"]),
+        "workoutName": f"5x5 {plan['plan']}: " + "/".join(f"{e['kg']:g}" for e in main),
         "description": f"{summary} kg. Automatisch berechnet aus der Einheit vom {plan['after']}.",
         "sportType": sport, "estimatedDurationInSecs": 0,
         "workoutSegments": [{"segmentOrder": 1, "sportType": sport, "workoutSteps": steps}],
@@ -204,10 +229,37 @@ def build_workout(plan):
 def describe(plan):
     lines = [f"Nächste Einheit: Plan {plan['plan']} am {date.fromisoformat(plan['date']):%d.%m.%Y}"]
     for ex in plan["exercises"]:
-        cfg = LIFTS[ex["lift"]]
+        cfg = cfg_of(ex["lift"])
         warm = ", ".join(f"{w:g}×{r}" for w, r in ex["warmup"]) or "–"
-        lines.append(f"  {cfg['label']:<15} {cfg['sets']}×{REPS} mit {ex['kg']:g} kg  (Aufwärmen: {warm}; {ex['why']})")
+        load = "Körpergewicht" if ex["kg"] is None else f"{ex['kg']:g} kg"
+        lines.append(f"  {cfg['label']:<15} {cfg['sets']}×{cfg.get('reps', REPS)} mit {load}  (Aufwärmen: {warm}; {ex['why']})")
     return "\n".join(lines)
+
+
+def write_plan_table(plan):
+    """Legt den Plan als Tabelle next_workout in die Zusatz-DB — für Dashboards und den Chat."""
+    rows = []
+    for ex in plan["exercises"]:
+        cfg = cfg_of(ex["lift"])
+        groups = []  # gleiche Aufwärmsätze zusammenfassen: 20×5, 20×5 → 2 Sätze
+        for kg, reps in ex["warmup"]:
+            if groups and groups[-1][1:] == [kg, reps]:
+                groups[-1][0] += 1
+            else:
+                groups.append([1, kg, reps])
+        for sets, kg, reps in groups:
+            rows.append(("Aufwärmen", cfg, sets, reps, kg, None))
+        rows.append(("Arbeitssatz", cfg, cfg["sets"], cfg.get("reps", REPS), ex["kg"], ex["why"]))
+    con = sqlite3.connect(DATA / "garmin_extras.db")
+    with con:
+        con.execute("DROP TABLE IF EXISTS next_workout")
+        con.execute("CREATE TABLE next_workout (position INTEGER PRIMARY KEY, plan, planned_date, exercise,"
+                    " exercise_name, kind, sets INTEGER, reps INTEGER, weight_kg REAL, reason)")
+        con.executemany(
+            "INSERT INTO next_workout VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [(i, plan["plan"], plan["date"], cfg["label"], cfg["name"], kind, sets, reps, kg, why)
+             for i, (kind, cfg, sets, reps, kg, why) in enumerate(rows, 1)])
+    con.close()
 
 
 def open_client():
@@ -220,60 +272,82 @@ def open_client():
     return client
 
 
+def _delete(client, path):
+    """DELETE, das ein schon Gelöschtes (404) stillschweigend hinnimmt."""
+    try:
+        client._request("DELETE", path)
+    except Exception as exc:
+        if "API Error 404" not in str(exc):
+            raise
+
+
 def publish(plan, workout, state):
-    """Legt das Workout an bzw. überschreibt es, schickt es ans Gerät, plant es ein."""
+    """Legt das Workout neu an, schickt es ans Gerät, plant es ein und räumt das alte weg.
+
+    Bei jeder Änderung entsteht ein NEUES Workout statt das alte zu überschreiben: Die
+    fenix 6 übernimmt geänderte Gewichte eines schon gespeicherten Workouts sonst oft nicht.
+    """
     client = open_client()
     digest = hashlib.sha1(json.dumps(workout, sort_keys=True).encode()).hexdigest()
-    workout_id = state.get("workout_id")
-    if state.get("hash") != digest or not workout_id:
-        if workout_id:
-            try:  # überschreiben: gleiche ID, der Kalendereintrag bleibt gültig
-                client._request("PUT", f"/workout-service/workout/{workout_id}",
-                                json=workout | {"workoutId": workout_id})
-            except Exception as exc:
-                if "API Error 404" not in str(exc):
-                    raise
-                workout_id = None  # in Garmin Connect gelöscht → neu anlegen
-                state.pop("schedule_id", None)
-        if not workout_id:
-            workout_id = client._request("POST", "/workout-service/workout", json=workout).json()["workoutId"]
+    old_id, old_schedule = state.get("workout_id"), state.get("schedule_id")
+    if state.get("hash") != digest or not old_id:
+        workout_id = client._request("POST", "/workout-service/workout", json=workout).json()["workoutId"]
         device = client._connectapi("/device-service/deviceservice/mylastused")
         client._request("POST", "/device-service/devicemessage/messages", json=[{
             "deviceId": device["userDeviceId"], "messageUrl": f"workout-service/workout/FIT/{workout_id}",
             "messageType": "workouts", "groupName": None, "messageName": workout["workoutName"],
             "priority": 1, "fileType": "FIT", "metaDataId": workout_id}])
-        state.update(workout_id=workout_id, hash=digest)
-        print(f"Workout {workout_id} geschrieben und an {device.get('lastUsedDeviceName')} geschickt")
-    if state.get("schedule_date") != plan["date"] or not state.get("schedule_id"):
-        if state.get("schedule_id"):
-            try:
-                client._request("DELETE", f"/workout-service/schedule/{state['schedule_id']}")
-            except Exception as exc:
-                if "API Error 404" not in str(exc):
-                    raise
         scheduled = client._request("POST", f"/workout-service/schedule/{workout_id}",
                                     json={"date": plan["date"]}).json()
+        state.update(workout_id=workout_id, hash=digest, schedule_date=plan["date"],
+                     schedule_id=scheduled.get("workoutScheduleId"))
+        print(f"Workout {workout_id} angelegt, an {device.get('lastUsedDeviceName')} geschickt,"
+              f" eingeplant für {plan['date']}")
+        # Erst wenn das neue steht, das alte samt Kalendereintrag entfernen.
+        if old_schedule:
+            _delete(client, f"/workout-service/schedule/{old_schedule}")
+        if old_id and old_id != workout_id:
+            _delete(client, f"/workout-service/workout/{old_id}")
+            print(f"altes Workout {old_id} gelöscht")
+    elif state.get("schedule_date") != plan["date"] or not state.get("schedule_id"):
+        if old_schedule:
+            _delete(client, f"/workout-service/schedule/{old_schedule}")
+        scheduled = client._request("POST", f"/workout-service/schedule/{old_id}",
+                                    json={"date": plan["date"]}).json()
         state.update(schedule_id=scheduled.get("workoutScheduleId"), schedule_date=plan["date"])
-        print(f"im Kalender eingeplant für {plan['date']}")
+        print(f"im Kalender verschoben auf {plan['date']}")
     state["plan"] = plan
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--dry-run", action="store_true", help="nur berechnen und anzeigen")
+    ap.add_argument("--today", action="store_true",
+                    help="nächste Einheit auf heute legen (gilt, bis sie gemacht ist oder der Tag vorbei ist)")
     args = ap.parse_args()
 
-    plan = plan_next(date.today())
+    today = date.today()
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    before = json.dumps(state, sort_keys=True)
+    plan = plan_next(today)
     if not plan:
         print("keine 5x5-Einheit in der Historie — nichts zu planen")
         return
+    # Ein von Hand gesetzter Termin gilt nur für genau diese nächste Einheit und nur,
+    # solange der Tag nicht vorbei ist — danach greift wieder die Regel.
+    if args.today:
+        state["pinned"] = {"after": plan["after"], "date": today.isoformat()}
+    pinned = state.get("pinned")
+    if pinned and pinned["after"] == plan["after"] and pinned["date"] >= today.isoformat():
+        plan = plan_next(today, date.fromisoformat(pinned["date"]))
+    else:
+        state.pop("pinned", None)
     workout = build_workout(plan)
     print(describe(plan))
     if args.dry_run:
         print(f"Workout-Name: {workout['workoutName']}")
         return
-    state = json.loads(STATE.read_text()) if STATE.exists() else {}
-    before = json.dumps(state, sort_keys=True)
+    write_plan_table(plan)
     publish(plan, workout, state)
     if json.dumps(state, sort_keys=True) != before:
         STATE.write_text(json.dumps(state, ensure_ascii=False, indent=1))

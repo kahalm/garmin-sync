@@ -187,6 +187,37 @@ def guess_stronglifts(active):
     return labels
 
 
+WORK_REPS = 5
+WORK_SETS = {"BARBELL_DEADLIFT": 1}  # Arbeitssätze je Einheit; alle anderen Übungen 5
+
+
+def work_sets(sets):
+    """Arbeitsgewicht je Übung einer Einheit: [(Name, Kategorie, kg, [Wdh.], geschafft)].
+
+    Das Arbeitsgewicht ist das Gewicht mit den meisten Sätzen nahe am Maximum (also nicht
+    die Aufwärmsätze); bei Übungen mit nur einem Arbeitssatz das schwerste.
+    """
+    by_exercise = {}
+    for s in sets:
+        if s["type"] == "ACTIVE" and s["kg"] and s["reps"] and s["name"]:
+            by_exercise.setdefault((s["name"], s["category"]), []).append((s["kg"], s["reps"]))
+    out = []
+    for (name, category), done in by_exercise.items():
+        target = WORK_SETS.get(name, 5)
+        top = max(kg for kg, _ in done)
+        if target == 1:
+            work = top
+        else:
+            count = {}
+            for kg, _ in done:
+                if kg >= 0.8 * top:
+                    count[kg] = count.get(kg, 0) + 1
+            work = max(count, key=lambda kg: (count[kg], kg))
+        reps = [r for kg, r in done if kg == work]
+        out.append((name, category, work, reps, sum(r >= WORK_REPS for r in reps) >= target))
+    return out
+
+
 def read_strength_sets():
     """Alle Kraftsätze aus den Rohdateien, je Einheit (activity_id, Tag, Sätze)."""
     for f in sorted(glob.glob(str(DATA / "garmin_files" / "storage" / "*_EXERCISE_SETS_*.json"))):
@@ -246,12 +277,15 @@ def rebuild_db():
     # Kraftsätze: Das Werkzeug verwirft Sätze ohne messageIndex — den lässt Garmin weg,
     # sobald man die Übungen einer Einheit in Connect von Hand benennt. Hier zählt
     # stattdessen die Position in der Rohdatei.
-    strength = []
+    strength, strength_work = [], []
     for activity_id, day, sets in read_strength_sets():
         for s in sets:
             strength.append((activity_id, day, s["idx"], s["type"], s["start"], s["duration"],
                              s["reps"], s["kg"], s["category"], s["name"], s["probability"],
                              s["garmin_category"], s["garmin_name"], int(s["guessed"])))
+        for name, category, kg, reps, ok in work_sets(sets):
+            strength_work.append((activity_id, day, name, category, kg, len(reps),
+                                  ",".join(map(str, reps)), int(ok)))
 
     tmp = DB.with_suffix(".db.tmp")
     tmp.unlink(missing_ok=True)
@@ -277,7 +311,53 @@ def rebuild_db():
                 " exercise_name, exercise_probability, garmin_category, garmin_name, guessed INTEGER,"
                 " PRIMARY KEY (activity_id, set_idx))")
     con.executemany("INSERT INTO strength_set_all VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", strength)
+    # MyFitnessPal-Tagebuch (mfp_sync.py): je Lebensmittel und je Tag mit Makros.
+    NUTR = ("calories", "protein", "carbohydrates", "fat", "sugar", "fiber", "sodium")
+    con.execute("CREATE TABLE food_entry (calendarDate TEXT, meal TEXT, name TEXT, quantity, unit TEXT, "
+                + ", ".join(f"{n} REAL" for n in NUTR) + ")")
+    con.execute("CREATE TABLE food_daily (calendarDate TEXT PRIMARY KEY, complete INTEGER, entries INTEGER, "
+                + ", ".join(f"{n} REAL" for n in NUTR) + ", "
+                + ", ".join(f"goal_{n} REAL" for n in NUTR) + ")")
+    for f in sorted(glob.glob(str(RAW / "mfp" / "*" / "*.json"))):
+        day = json.loads(Path(f).read_text())
+        n_entries = 0
+        for meal in day.get("meals") or []:
+            for e in meal.get("entries") or []:
+                n_entries += 1
+                con.execute(f"INSERT INTO food_entry VALUES (?,?,?,?,?,{','.join('?' * len(NUTR))})",
+                            [day["date"], meal.get("name"), e.get("name"), e.get("quantity"), e.get("unit")]
+                            + [(e.get("nutrition") or {}).get(n) for n in NUTR])
+        if n_entries:
+            con.execute(f"INSERT INTO food_daily VALUES (?,?,?,{','.join('?' * (2 * len(NUTR)))})",
+                        [day["date"], int(bool(day.get("complete"))), n_entries]
+                        + [(day.get("totals") or {}).get(n) for n in NUTR]
+                        + [(day.get("goals") or {}).get(n) for n in NUTR])
     con.commit()
+
+    # Tagesgewicht aus der Haupt-DB, damit Abfragen auf dieser DB Essen, Verbrauch und
+    # Gewicht zusammen sehen (Energiebilanz-Panel in Grafana).
+    main_db = DATA / "garmin_data.db"
+    con.execute("CREATE TABLE weight_daily (calendarDate TEXT PRIMARY KEY, kg REAL, wiegungen INTEGER)")
+    if main_db.exists():
+        con.execute("ATTACH DATABASE ? AS main_db", (str(main_db),))
+        con.execute("INSERT INTO weight_daily SELECT date(timestamp), round(avg(weight) / 1000.0, 2), count(*)"
+                    " FROM main_db.body_composition WHERE weight > 0 GROUP BY 1")
+        con.commit()
+        con.execute("DETACH DATABASE main_db")
+    # Je Einheit und Übung das Arbeitsgewicht — Grundlage für Planung und Dashboards.
+    con.execute("CREATE TABLE strength_work (activity_id INTEGER, calendarDate TEXT, exercise_name,"
+                " exercise_category, work_kg REAL, work_sets INTEGER, work_reps TEXT, success INTEGER,"
+                " PRIMARY KEY (activity_id, exercise_name))")
+    con.executemany("INSERT INTO strength_work VALUES (?,?,?,?,?,?,?,?)", strength_work)
+    con.commit()
+    # next_workout gehört next_workout.py und wird hier nur mitgenommen, damit sie den
+    # Neubau der Datei überlebt.
+    if DB.exists():
+        con.execute("ATTACH DATABASE ? AS old", (str(DB),))
+        if con.execute("SELECT 1 FROM old.sqlite_master WHERE name = 'next_workout'").fetchone():
+            con.execute("CREATE TABLE next_workout AS SELECT * FROM old.next_workout")
+        con.commit()
+        con.execute("DETACH DATABASE old")
     con.close()
     tmp.replace(DB)
     log(f"DB neu gebaut: {len(summaries)} Tage, {len(hrv)} HRV, {len(vo2)} VO2max, "

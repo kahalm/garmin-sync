@@ -14,6 +14,7 @@ services:
       SYNC_TIME: "05:40"          # täglicher Abgleich
       REFRESH_SECONDS: "300"      # so oft prüfen, ob die Uhr neu hochgeladen hat (0 = aus)
       PUSH_NEXT_WORKOUT: "1"      # nächste 5x5-Einheit als Workout auf die Uhr (schreibt ins Garmin-Konto)
+      TRAINING_BLOCKED_WEEKDAYS: "2,4"  # an diesen Tagen kein Termin (0 = Mo … 6 = So; hier Mi + Fr)
     volumes:
       # Datenbanken, Rohdateien, Tokens und Logs — alles, was überleben muss.
       - ./data:/data
@@ -48,9 +49,32 @@ services:
       - ./data:/data:ro
     tmpfs:
       - /data/.garminconnect  # verdeckt die Garmin-Tokens vor diesem Container
+      - /data/.mfp            # ebenso die MyFitnessPal-Cookies
       - /tmp
     ports:
       - "127.0.0.1:8103:8000"
+    labels:
+      - com.centurylinklabs.watchtower.enable=false
+    logging:
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # Knopf „nächste Einheit heute machen“ (für Grafana). Braucht Schreibzugriff und die
+  # Garmin-Tokens, nutzt aber dasselbe Lock wie der Abgleich. Nur über den Reverse-Proxy
+  # der Grafana-Seite erreichbar (kein Host-Port).
+  button:
+    image: garmin-sync:local
+    container_name: garmin-workout-button
+    command: ["button"]
+    init: true
+    user: "1000:1000"
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Vienna
+      TRAINING_BLOCKED_WEEKDAYS: "2,4"
+    volumes:
+      - ./data:/data
     labels:
       - com.centurylinklabs.watchtower.enable=false
     logging:

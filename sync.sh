@@ -52,6 +52,14 @@ EOF
   # Tageszusammenfassung, Uhr-FIT-Dateien, HRV, VO2max — holt das Werkzeug nicht.
   "$BIN/python" "$APP/extras.py" --from "$START" || RC=$?
 fi
+# MyFitnessPal-Tagebuch (nur wenn data/.mfp/cookies.txt da ist); ein Fehler dort hält den
+# Garmin-Abgleich nicht auf. Danach die Zusatz-DB neu bauen, damit die Tabellen stimmen.
+if [[ -f "$DATA/.mfp/cookies.txt" ]]; then
+  MFP_PY=${MFP_PYTHON:-/opt/mfp/bin/python}
+  [[ -x "$MFP_PY" ]] || MFP_PY="$APP/.venv-mfp/bin/python"
+  "$MFP_PY" "$APP/mfp_sync.py" && "$BIN/python" "$APP/extras.py" --db-only >/dev/null || true
+fi
+
 # Nächste 5x5-Einheit als Workout nach Garmin Connect schreiben — nur wenn gewünscht,
 # denn das ist der einzige Schritt, der im Garmin-Konto etwas ändert.
 if [[ "${PUSH_NEXT_WORKOUT:-0}" == 1 ]]; then

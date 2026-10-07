@@ -12,6 +12,7 @@ case "${1:-run}" in
   run) ;;
   auth) shift; exec garmin auth "$@" ;;
   mcp) exec python "$APP/mcp_server.py" ;;
+  button) exec python "$APP/workout_button.py" ;;
   sync) shift; exec "$APP/sync.sh" "$@" ;;
   backfill) shift; exec "$APP/backfill.sh" "$@" ;;
   extras) shift; exec python "$APP/extras.py" "$@" ;;

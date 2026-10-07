@@ -4,5 +4,7 @@
 !backfill.sh
 !extras.py
 !next_workout.py
+!workout_button.py
+!mfp_sync.py
 !mcp_server.py
 !entrypoint.sh
